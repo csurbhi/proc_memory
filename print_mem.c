@@ -4,8 +4,90 @@
 #include<linux/sched.h>
 #include<linux/debugfs.h>
 #include<linux/seq_file.h>
+#include <linux/pgtable.h>
 
 int pidnr = 0;
+
+
+void walk_task_vma_pages(struct vm_area_struct *vma, unsigned long start, unsigned long end)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep, pte;
+	spinlock_t *ptl;
+	unsigned long addr;
+
+
+	for (addr = start; addr < end; addr += PAGE_SIZE) {
+		// 1. Find the Global Directory entry
+		pgd = pgd_offset(mm, addr);
+		if (pgd_none(*pgd) || pgd_bad(*pgd)) {
+			pr_info("\n Could not find the global directory");
+			// Jump to the next PGD boundary to save time
+			addr = (addr + PGDIR_SIZE) & PGDIR_MASK;
+			addr -= PAGE_SIZE; // Adjust for loop increment
+			continue;
+		}
+		// 2. Find the 4th level (often folded into PGD)
+		p4d = p4d_offset(pgd, addr);
+		if (p4d_none(*p4d) || p4d_bad(*p4d)) {
+			pr_info("\n Could not find the 4th level page directory");
+			continue;
+		}
+		// 3. Find the Upper Directory
+		pud = pud_offset(p4d, addr);
+		if (pud_none(*pud) || pud_bad(*pud)) {
+			pr_info("\n Could not find the 3rd level upper directory");
+			continue;
+		}
+		// 4. Find the Middle Directory (where Huge Pages often live)
+		pmd = pmd_offset(pud, addr);
+		if (pmd_none(*pmd) || pmd_bad(*pmd)) {
+			pr_info("\n Could not find the 2nd level middle directory");
+			continue;
+		}
+		// 5. Lock and Map the Page Table Entry (PTE)
+		// This returns a pointer to the PTE and locks the Page Table Lock (ptl)
+		ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+		if (!ptep) {
+			pr_info("\n Could not lock the pte entry ");
+			continue;
+		}
+		pte = *ptep;
+		if (pte_present(pte)) {
+			unsigned long pfn = pte_pfn(pte);
+			pr_info("Virtual 0x%lx -> Physical 0x%lx\n", addr, pfn << PAGE_SHIFT);
+			// Only apply if it's currently writable in the PTE
+			if (pte_write(*ptep)) {
+				pte_t pte = pte_wrprotect(*ptep);
+				set_pte_at(mm, addr, ptep, pte);
+			}
+		}
+		// 6. Cleanup
+		pte_unmap_unlock(ptep, ptl);
+	}
+}
+
+static int my_pte_callback(pte_t *ptep, unsigned long addr, 
+				unsigned long next, struct mm_walk *walk)
+{
+	pte_t pte = *ptep;
+	if (pte_present(pte)) {
+		// Apply your COW logic here
+		pte = pte_wrprotect(pte);
+		set_pte_at(walk->mm, addr, ptep, pte);
+	}
+	return 0;
+}
+
+static const struct mm_walk_ops my_walk_ops = {
+	.pte_entry = my_pte_callback,
+}
+
+
 
 /* 1. The 'Start' function: Initializes the iterator */
 static void *my_seq_start(struct seq_file *s, loff_t *pos)
@@ -22,6 +104,30 @@ static void *my_seq_start(struct seq_file *s, loff_t *pos)
 		i++;
 	}
 	return NULL;
+}
+
+void protect_all_pages_of_task(struct task_struct *task)
+{
+	struct mm_struct *mm = task->mm;
+	struct vm_area_struct *vma;
+
+	if(!mm)
+		return;
+
+	VMA_ITERATOR(vmi, mm, 0);
+	// 1. Lock the address space for the entire duration
+	mmap_read_lock(mm);
+	// 2. Iterate over every VMA in the task
+	for_each_vma(vmi, vma) {
+		// Skip special VMAs that shouldn't be COW (like VDSO or special device maps)
+		if (vma->vm_flags & (VM_IO | VM_PFNMAP | VM_DONTEXPAND))
+			continue;
+		// 3. Walk the page tables for this specific VMA range
+		protect_vma_page_range(vma, vma->vm_start, vma->vm_end);
+		// 4. Flush the TLB for this VMA range once
+		flush_tlb_range(vma, vma->vm_start, vma->vm_end);
+	}
+	mmap_read_unlock(mm);
 }
 
 /* 2. The 'Next' function: Moves to the next VMA */
@@ -97,7 +203,7 @@ static int __init procmem_init(void)
 	struct task_struct *task = get_pid_task(pid, PIDTYPE_PID);
 	if (task) {
 		/* task->mm is the private pointer that will be stored in the inode->i_private */
-		debugfs_create_file("process_pages", 0444, debug_dir, task->mm, &my_fops);
+		debugfs_create_file("process_mem", 0444, debug_dir, task->mm, &my_fops);
 	} else {
 		debugfs_remove_recursive(debug_dir);
 	}
