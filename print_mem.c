@@ -1,12 +1,90 @@
 #include<linux/module.h>
 #include<linux/printk.h>
-#include<linux/mm.h>
 #include<linux/sched.h>
 #include<linux/debugfs.h>
 #include<linux/seq_file.h>
 #include <linux/pgtable.h>
+#include <linux/pagewalk.h>
+#include <linux/kprobes.h>
+#include <asm/tlbflush.h>
+#include<linux/mm.h>
 
 int pidnr = 0;
+
+
+static int handler_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	/* On x86_64, handle_mm_fault arguments are:
+	 * %rdi: struct vm_area_struct *vma
+	 * %rsi: unsigned long address
+	 * %rdx: unsigned int flags
+	 */
+	struct vm_area_struct *vma = (struct vm_area_struct *)regs->di;
+	unsigned long addr = regs->si;
+	unsigned int flags = regs->dx;
+	// Check if it's a WRITE fault on a page we marked Read-Only
+	if ((flags & FAULT_FLAG_WRITE) && (vma->vm_flags & VM_WRITE)) {
+		/* 1. Manually find the page
+		 * 2. kmalloc a new page
+		 * 3. copy_page(new_page, old_page)
+		 * 4. Store your copy in a RADIX Tree - then later you can access the 
+		 *    read only pages from the process and from this RADIX tree - this
+		 *    will be your original process task tree.
+		 *    You will have to use the VMA to mark the pages writeable when you
+		 *    have return the checkpoint!
+		 */
+		pr_info("Intercepted COW fault at 0x%lx\n", addr);
+		struct mm_struct *mm = vma->vm_mm;
+		pgd_t *pgd;
+		p4d_t *p4d;
+		pud_t *pud;
+		pmd_t *pmd;
+		pte_t *ptep, pte;
+		spinlock_t *ptl;
+
+		/* 1. Standard Page Table Walk */
+		pgd = pgd_offset(mm, addr);
+		if (pgd_none(*pgd) || pgd_bad(*pgd))
+			return -1; 
+		p4d = p4d_offset(pgd, addr);
+		if (p4d_none(*p4d) || p4d_bad(*p4d))
+			return -2;
+		pud = pud_offset(p4d, addr);
+		if (pud_none(*pud) || pud_bad(*pud))
+			return -3;
+		pmd = pmd_offset(pud, addr);
+		if (pmd_none(*pmd) || pmd_bad(*pmd))
+			return -4;
+		/*2. Lock the PTE level */
+		ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+		if (!ptep)
+			return -5;
+		pte = *ptep;
+		if (pte_present(pte)) {
+			/* 3. Set the Write bit */
+			pte = pte_mkwrite_novma(pte);
+			/* 4. Mark the page modified */
+			pte = pte_mkdirty(pte); 
+
+			/* 5. Update the Hardware Table */
+			set_pte_at(mm, addr, ptep, pte);
+
+			/* 6. CRITICAL: Flush the TLB for this address
+			 * If you don't flush, the CPU will still think it's Read-Only
+			 * and trigger an infinite loop of page faults!
+			 */
+			//flush_tlb_page(vma, addr);
+		}
+		pte_unmap_unlock(ptep, ptl);
+	}
+	return 0;
+}
+
+static struct kprobe kp = {
+	.symbol_name = "handle_mm_fault",
+	.pre_handler = handler_pre,
+};
+
 
 
 void walk_task_vma_pages(struct vm_area_struct *vma, unsigned long start, unsigned long end)
@@ -85,7 +163,7 @@ static int my_pte_callback(pte_t *ptep, unsigned long addr,
 
 static const struct mm_walk_ops my_walk_ops = {
 	.pte_entry = my_pte_callback,
-}
+};
 
 
 
@@ -123,9 +201,9 @@ void protect_all_pages_of_task(struct task_struct *task)
 		if (vma->vm_flags & (VM_IO | VM_PFNMAP | VM_DONTEXPAND))
 			continue;
 		// 3. Walk the page tables for this specific VMA range
-		protect_vma_page_range(vma, vma->vm_start, vma->vm_end);
+		walk_task_vma_pages(vma, vma->vm_start, vma->vm_end);
 		// 4. Flush the TLB for this VMA range once
-		flush_tlb_range(vma, vma->vm_start, vma->vm_end);
+		//flush_tlb_range(vma, vma->vm_start, vma->vm_end);
 	}
 	mmap_read_unlock(mm);
 }
@@ -206,7 +284,10 @@ static int __init procmem_init(void)
 		debugfs_create_file("process_mem", 0444, debug_dir, task->mm, &my_fops);
 	} else {
 		debugfs_remove_recursive(debug_dir);
+		return -1;
 	}
+	protect_all_pages_of_task(task);
+	register_kprobe(&kp);
 	return 0;
 }
 
